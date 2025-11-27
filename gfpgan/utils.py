@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 import os
 import torch
 from basicsr.utils import img2tensor, tensor2img
@@ -8,6 +9,7 @@ from torchvision.transforms.functional import normalize
 try:
     import onnxruntime as ort  # optional; used only when loading .onnx model
 except Exception:  # pragma: no cover
+    print("onnxruntime is not installed")
     ort = None
 
 from gfpgan.archs.gfpgan_bilinear_arch import GFPGANBilinear
@@ -192,3 +194,181 @@ class GFPGANer():
             return self.face_helper.cropped_faces, self.face_helper.restored_faces, restored_img
         else:
             return self.face_helper.cropped_faces, self.face_helper.restored_faces, None
+
+    def enhance_batch(self, imgs, has_aligned=False, only_center_face=True, paste_back=True, weight=0.5, batch_size=None):
+        """Batch processing for multiple images with ONNX model (one face per image).
+
+        Args:
+            imgs (list): List of input images (numpy arrays in BGR format).
+            has_aligned (bool): Whether the inputs are already aligned faces. Default: False.
+            only_center_face (bool): Only restore the center face. Default: True.
+            paste_back (bool): Paste the restored face back to the original image. Default: True.
+            weight (float): Adjustable weight for restoration strength. Default: 0.5.
+            batch_size (int, optional): Number of faces to process in each inference batch.
+                If None, processes all faces in a single batch. Default: None.
+
+        Returns:
+            tuple: (list_of_cropped_faces, list_of_restored_faces, list_of_restored_images)
+                Each list element corresponds to one input image.
+        """
+        if not self.use_ort:
+            raise RuntimeError('enhance_batch() only supports ONNX models. Use enhance() for PyTorch models.')
+
+        # =====================================================================
+        # FIRST PASS: Detect and align faces for all images, collect all faces
+        # =====================================================================
+        all_cropped_faces = []  # List of cropped faces (one per image)
+        all_face_helpers = []   # Store face helper state for each image
+        all_original_imgs = []  # Store original images for paste back
+
+        for img in imgs:
+            self.face_helper.clean_all()
+
+            if has_aligned:
+                # Input is already aligned, just resize to 512x512
+                resized_img = cv2.resize(img, (512, 512))
+                self.face_helper.cropped_faces = [resized_img]
+            else:
+                self.face_helper.read_image(img)
+                # Get face landmarks (only center face since we have one face per image)
+                self.face_helper.get_face_landmarks_5(only_center_face=only_center_face, eye_dist_threshold=5)
+                # Align and warp face
+                self.face_helper.align_warp_face()
+
+            # Store the cropped face (assuming one face per image)
+            if len(self.face_helper.cropped_faces) > 0:
+                all_cropped_faces.append(self.face_helper.cropped_faces[0])
+                # Store face helper state for paste back
+                all_face_helpers.append({
+                    'affine_matrices': self.face_helper.affine_matrices.copy() if hasattr(self.face_helper, 'affine_matrices') else [],
+                    'inverse_affine_matrices': self.face_helper.inverse_affine_matrices.copy() if hasattr(self.face_helper, 'inverse_affine_matrices') else [],
+                    'det_faces': self.face_helper.det_faces.copy() if hasattr(self.face_helper, 'det_faces') else [],
+                    'input_img': self.face_helper.input_img.copy() if self.face_helper.input_img is not None else None,
+                })
+            else:
+                # No face detected, use placeholder
+                all_cropped_faces.append(None)
+                all_face_helpers.append(None)
+
+            all_original_imgs.append(img)
+
+        # =====================================================================
+        # SECOND PASS: Batch all faces and run ONNX inference (with optional chunking)
+        # =====================================================================
+        # Prepare batch tensor for all valid faces
+        valid_indices = [i for i, face in enumerate(all_cropped_faces) if face is not None]
+        valid_faces = [all_cropped_faces[i] for i in valid_indices]
+
+        if len(valid_faces) == 0:
+            # No faces detected in any image
+            return [[] for _ in imgs], [[] for _ in imgs], [None for _ in imgs]
+
+        # Convert all faces to tensors
+        face_tensors = []
+        for cropped_face in valid_faces:
+            cropped_face_t = img2tensor(cropped_face / 255., bgr2rgb=True, float32=True)
+            normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+            face_tensors.append(cropped_face_t)
+
+        # Process in batches if batch_size is specified
+        all_outputs = []
+        if batch_size is None or batch_size <= 0:
+            # Process all faces in a single batch
+            batch_tensor = torch.stack(face_tensors, dim=0)
+            batch_np = batch_tensor.numpy().astype('float32')
+
+            try:
+                input_dict = {}
+                if len(self.ort_input_names) == 1:
+                    input_dict[self.ort_input_names[0]] = batch_np
+                else:
+                    # Heuristic: first is image, any input containing 'weight' gets the scalar
+                    for name in self.ort_input_names:
+                        if 'weight' in name.lower():
+                            input_dict[name] = float(weight)
+                        else:
+                            input_dict[name] = batch_np
+
+                ort_outputs = self.ort_session.run(self.ort_output_names, input_dict)
+                # Output shape: (batch_size, 3, 512, 512)
+                all_outputs.append(ort_outputs[0])
+            except RuntimeError as error:
+                print(f'\tFailed batch inference for GFPGAN: {error}.')
+                # Fallback: return original faces
+                all_outputs.append(batch_np)
+        else:
+            # Process faces in chunks
+            num_faces = len(face_tensors)
+            for start_idx in range(0, num_faces, batch_size):
+                end_idx = min(start_idx + batch_size, num_faces)
+                chunk_tensors = face_tensors[start_idx:end_idx]
+
+                # Stack into batch: (chunk_size, 3, 512, 512)
+                batch_tensor = torch.stack(chunk_tensors, dim=0)
+                batch_np = batch_tensor.numpy().astype('float32')
+
+                try:
+                    input_dict = {}
+                    if len(self.ort_input_names) == 1:
+                        input_dict[self.ort_input_names[0]] = batch_np
+                    else:
+                        # Heuristic: first is image, any input containing 'weight' gets the scalar
+                        for name in self.ort_input_names:
+                            if 'weight' in name.lower():
+                                input_dict[name] = float(weight)
+                            else:
+                                input_dict[name] = batch_np
+
+                    ort_outputs = self.ort_session.run(self.ort_output_names, input_dict)
+                    # Output shape: (chunk_size, 3, 512, 512)
+                    all_outputs.append(ort_outputs[0])
+                except RuntimeError as error:
+                    print(f'\tFailed batch inference for GFPGAN (chunk {start_idx//batch_size + 1}): {error}.')
+                    # Fallback: return original faces
+                    all_outputs.append(batch_np)
+
+        # Concatenate all batch outputs into a single array
+        output_batch_np = np.concatenate(all_outputs, axis=0)
+
+        # =====================================================================
+        # THIRD PASS: Split results and paste restored faces back to original images
+        # =====================================================================
+        all_restored_faces = [None] * len(imgs)
+        all_restored_imgs = [None] * len(imgs)
+        all_cropped_faces_out = [[] for _ in imgs]
+        all_restored_faces_out = [[] for _ in imgs]
+
+        for batch_idx, img_idx in enumerate(valid_indices):
+            # Extract restored face from batch output
+            output_tensor = torch.from_numpy(output_batch_np[batch_idx])
+            restored_face = tensor2img(output_tensor, rgb2bgr=True, min_max=(-1, 1))
+            restored_face = restored_face.astype('uint8')
+
+            all_cropped_faces_out[img_idx] = [all_cropped_faces[img_idx]]
+            all_restored_faces_out[img_idx] = [restored_face]
+
+            if not has_aligned and paste_back:
+                # Restore face helper state for this image
+                helper_state = all_face_helpers[img_idx]
+                if helper_state is not None:
+                    self.face_helper.clean_all()
+                    self.face_helper.affine_matrices = helper_state['affine_matrices']
+                    self.face_helper.inverse_affine_matrices = helper_state['inverse_affine_matrices']
+                    self.face_helper.det_faces = helper_state['det_faces']
+                    self.face_helper.input_img = helper_state['input_img']
+                    self.face_helper.cropped_faces = [all_cropped_faces[img_idx]]
+                    self.face_helper.restored_faces = [restored_face]
+
+                    # Upsample background if needed
+                    if self.bg_upsampler is not None:
+                        bg_img = self.bg_upsampler.enhance(all_original_imgs[img_idx], outscale=self.upscale)[0]
+                    else:
+                        bg_img = None
+
+                    self.face_helper.get_inverse_affine(None)
+                    restored_img = self.face_helper.paste_faces_to_input_image(upsample_img=bg_img)
+                    all_restored_imgs[img_idx] = restored_img
+            else:
+                all_restored_imgs[img_idx] = None
+
+        return all_cropped_faces_out, all_restored_faces_out, all_restored_imgs
