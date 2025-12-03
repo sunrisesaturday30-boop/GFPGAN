@@ -33,15 +33,21 @@ class GFPGANer():
         arch (str): The GFPGAN architecture. Option: clean | original. Default: clean.
         channel_multiplier (int): Channel multiplier for large networks of StyleGAN2. Default: 2.
         bg_upsampler (nn.Module): The upsampler for the background. Default: None.
+        mode (str): Detection mode. Options:
+            - 'internal' (default): GFPGAN runs its own face detection, alignment, and paste-back.
+            - 'external': Caller provides already-aligned face crops; GFPGAN only enhances them
+              and returns restored crops without paste-back. Use this when detection/alignment
+              is handled externally (e.g., by Easy-Wav2Lip) to avoid duplicate work.
     """
 
-    def __init__(self, model_path, upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=None):
+    def __init__(self, model_path, upscale=2, arch='clean', channel_multiplier=2, bg_upsampler=None, device=None, mode='internal'):
         self.upscale = upscale
         self.bg_upsampler = bg_upsampler
         self.use_ort = False
         self.ort_session = None
         self.ort_input_names = None
         self.ort_output_names = None
+        self.mode = mode  # 'internal' or 'external'
 
         # initialize model
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device is None else device
@@ -129,6 +135,11 @@ class GFPGANer():
     def enhance(self, img, has_aligned=False, only_center_face=False, paste_back=True, weight=0.5):
         self.face_helper.clean_all()
 
+        # In external mode, treat input as already-aligned crop and skip detection/paste-back
+        if self.mode == 'external':
+            has_aligned = True
+            paste_back = False
+
         if has_aligned:  # the inputs are already aligned
             img = cv2.resize(img, (512, 512))
             self.face_helper.cropped_faces = [img]
@@ -200,9 +211,13 @@ class GFPGANer():
 
         Args:
             imgs (list): List of input images (numpy arrays in BGR format).
+                In 'external' mode, these should be already-aligned face crops.
             has_aligned (bool): Whether the inputs are already aligned faces. Default: False.
+                Ignored in 'external' mode (always treated as True).
             only_center_face (bool): Only restore the center face. Default: True.
+                Ignored in 'external' mode.
             paste_back (bool): Paste the restored face back to the original image. Default: True.
+                Ignored in 'external' mode (always False, caller handles paste-back).
             weight (float): Adjustable weight for restoration strength. Default: 0.5.
             batch_size (int, optional): Number of faces to process in each inference batch.
                 If None, processes all faces in a single batch. Default: None.
@@ -210,12 +225,98 @@ class GFPGANer():
         Returns:
             tuple: (list_of_cropped_faces, list_of_restored_faces, list_of_restored_images)
                 Each list element corresponds to one input image.
+                In 'external' mode, list_of_restored_images is always [None, ...].
         """
         if not self.use_ort:
             raise RuntimeError('enhance_batch() only supports ONNX models. Use enhance() for PyTorch models.')
 
         # =====================================================================
-        # FIRST PASS: Detect and align faces for all images, collect all faces
+        # EXTERNAL MODE: Skip detection/alignment, treat imgs as aligned crops
+        # =====================================================================
+        if self.mode == 'external':
+            # In external mode, imgs are already-aligned face crops
+            # We resize them to 512x512 and run inference directly
+            all_cropped_faces = []
+            for img in imgs:
+                if img is not None:
+                    resized_img = cv2.resize(img, (512, 512))
+                    all_cropped_faces.append(resized_img)
+                else:
+                    all_cropped_faces.append(None)
+
+            valid_indices = [i for i, face in enumerate(all_cropped_faces) if face is not None]
+            valid_faces = [all_cropped_faces[i] for i in valid_indices]
+
+            if len(valid_faces) == 0:
+                return [[] for _ in imgs], [[] for _ in imgs], [None for _ in imgs]
+
+            # Convert to tensors and run ONNX inference (same as internal mode second pass)
+            face_tensors = []
+            for cropped_face in valid_faces:
+                cropped_face_t = img2tensor(cropped_face / 255., bgr2rgb=True, float32=True)
+                normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+                face_tensors.append(cropped_face_t)
+
+            all_outputs = []
+            if batch_size is None or batch_size <= 0:
+                batch_tensor = torch.stack(face_tensors, dim=0)
+                batch_np = batch_tensor.numpy().astype('float32')
+                try:
+                    input_dict = {}
+                    if len(self.ort_input_names) == 1:
+                        input_dict[self.ort_input_names[0]] = batch_np
+                    else:
+                        for name in self.ort_input_names:
+                            if 'weight' in name.lower():
+                                input_dict[name] = float(weight)
+                            else:
+                                input_dict[name] = batch_np
+                    ort_outputs = self.ort_session.run(self.ort_output_names, input_dict)
+                    all_outputs.append(ort_outputs[0])
+                except RuntimeError as error:
+                    print(f'\tFailed batch inference for GFPGAN (external mode): {error}.')
+                    all_outputs.append(batch_np)
+            else:
+                num_faces = len(face_tensors)
+                for start_idx in range(0, num_faces, batch_size):
+                    end_idx = min(start_idx + batch_size, num_faces)
+                    chunk_tensors = face_tensors[start_idx:end_idx]
+                    batch_tensor = torch.stack(chunk_tensors, dim=0)
+                    batch_np = batch_tensor.numpy().astype('float32')
+                    try:
+                        input_dict = {}
+                        if len(self.ort_input_names) == 1:
+                            input_dict[self.ort_input_names[0]] = batch_np
+                        else:
+                            for name in self.ort_input_names:
+                                if 'weight' in name.lower():
+                                    input_dict[name] = float(weight)
+                                else:
+                                    input_dict[name] = batch_np
+                        ort_outputs = self.ort_session.run(self.ort_output_names, input_dict)
+                        all_outputs.append(ort_outputs[0])
+                    except RuntimeError as error:
+                        print(f'\tFailed batch inference for GFPGAN (external mode, chunk {start_idx//batch_size + 1}): {error}.')
+                        all_outputs.append(batch_np)
+
+            output_batch_np = np.concatenate(all_outputs, axis=0)
+
+            # Build output lists (no paste-back in external mode)
+            all_cropped_faces_out = [[] for _ in imgs]
+            all_restored_faces_out = [[] for _ in imgs]
+            all_restored_imgs = [None] * len(imgs)
+
+            for batch_idx, img_idx in enumerate(valid_indices):
+                output_tensor = torch.from_numpy(output_batch_np[batch_idx])
+                restored_face = tensor2img(output_tensor, rgb2bgr=True, min_max=(-1, 1))
+                restored_face = restored_face.astype('uint8')
+                all_cropped_faces_out[img_idx] = [all_cropped_faces[img_idx]]
+                all_restored_faces_out[img_idx] = [restored_face]
+
+            return all_cropped_faces_out, all_restored_faces_out, all_restored_imgs
+
+        # =====================================================================
+        # INTERNAL MODE: Detect and align faces for all images, collect all faces
         # =====================================================================
         all_cropped_faces = []  # List of cropped faces (one per image)
         all_face_helpers = []   # Store face helper state for each image
